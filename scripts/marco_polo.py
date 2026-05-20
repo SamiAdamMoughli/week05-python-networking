@@ -1201,7 +1201,7 @@ if __name__ == "__main__":
     console = Console()
 
     formatter.print_panel(
-        "W5-04 — port_scanner_v3.py",
+        "MarcoPolo — Port Scanner v3",
         f"target: {args.target}  |  ethical use only",
     )
 
@@ -1214,7 +1214,7 @@ if __name__ == "__main__":
         report = scanner.generate_report(results)
         with open(f"marco_polo_{args.target}.md", "w") as f:
             f.write(report)
-        console.print(f"[grey66]report saved → scan_report_{args.target}.md[/grey66]")
+        console.print(f"[grey66]report saved → marco_polo_{args.target}.md[/grey66]")
     elif args.port_range:
         start, end = map(int, args.port_range.split("-"))
         scanner = PortScannerV3(args.target)
@@ -1223,5 +1223,6 @@ if __name__ == "__main__":
         report = scanner.generate_report(results)
         with open(f"marco_polo_{args.target}.md", "w") as f:
             f.write(report)
+        console.print(f"[grey66]report saved → marco_polo_{args.target}.md[/grey66]")
     else:
         parser.print_help()
