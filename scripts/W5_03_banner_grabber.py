@@ -1,18 +1,18 @@
 """Banner grabber and service fingerprinter using raw TCP sockets."""
 
-import sys
-
-from W5_04_network_formatter import NetworkFormatter
 import argparse
-from rich.console import Console
 import re
 import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from rich.console import Console
+
 sys.path.append(".")
+from W5_04_network_formatter import NetworkFormatter
 
 
 @dataclass
@@ -39,6 +39,17 @@ class ServiceInfo:
 class BannerGrabber:
     """Connects to TCP ports, sends protocol-appropriate probes, fingerprints responses."""
 
+    def _send_probe(self, sock: socket.socket, port: int) -> str:
+        """Send protocol-appropriate probe and return raw response.
+        HTTP ports get a HEAD request. FTP/SSH/SMTP/MySQL just read the banner.
+        All others get a bare CRLF to trigger a response.
+        """
+        if port in (80, 443, 8080, 8443):
+            sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+        elif port not in (21, 22, 25, 587, 3306):
+            sock.sendall(b"\r\n")
+        return sock.recv(1024).decode("utf-8", errors="replace")
+
     def grab(self, host: str, port: int, timeout: float = 3.0) -> Banner | None:
         """Connect to host:port, send probe, return fingerprinted Banner or None on failure."""
         try:
@@ -46,6 +57,20 @@ class BannerGrabber:
                 sock.settimeout(timeout)
                 sock.connect((host, port))
                 raw = self._send_probe(sock, port)
+                info = self.fingerprint(raw)
+                if port in (80, 443, 8080, 8443):
+                    status = raw.split("\r\n")[0]
+                    server = re.search(r"Server: (.+)", raw)
+                    raw = f"{status} | {server.group(1).strip()}" if server else status
+                if port == 3306:
+                    version = re.search(
+                        r"(\d+\.\d+\.\d+[^\x00]*)\x00",
+                        raw.encode("latin-1", errors="replace").decode("latin-1"),
+                    )
+                    auth = re.search(
+                        r"(caching_sha2_password|mysql_native_password)", raw
+                    )
+                    raw = f"MySQL {version.group(1) if version else ''} {auth.group(1) if auth else ''}".strip()
                 info = self.fingerprint(raw)
                 return Banner(
                     port=port,
@@ -58,55 +83,6 @@ class BannerGrabber:
         except (OSError, TimeoutError):
             return None
 
-    def _send_probe(self, sock: socket.socket, port: int) -> str:
-        """Send protocol-appropriate probe and return raw response.
-
-        HTTP ports get a HEAD request. FTP/SSH/SMTP just read the banner.
-        All others get a bare CRLF — enough to trigger a response on most services.
-        """
-        if port in (80, 443, 8080, 8443):
-            sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
-        elif port not in (21, 22, 25, 587):
-            sock.sendall(b"\r\n")
-        return sock.recv(1024).decode("utf-8", errors="replace")
-
-    def fingerprint(self, banner: str) -> ServiceInfo:
-        """Map raw banner string to ServiceInfo via regex.
-
-        Patterns kept simple to avoid ReDoS. Input truncated to 1024 bytes.
-        Confidence: high = strong pattern match, medium = partial, low = unknown.
-        """
-        if len(banner) > 1024:
-            banner = banner[:1024]
-
-        ssh = re.search(r"SSH-(\d+\.\d+)-(\S+)", banner)
-        http = re.search(r"Server: (.+)", banner)
-        ftp = re.search(r"220[- ](.+)", banner)
-
-        if ssh:
-            return ServiceInfo(
-                name=f"SSH-{ssh.group(2)}",
-                version=ssh.group(1),
-                confidence="high",
-            )
-        if http:
-            return ServiceInfo(
-                name=http.group(1).strip(),
-                version="",
-                confidence="high",
-            )
-        if ftp:
-            return ServiceInfo(
-                name=ftp.group(1).strip(),
-                version="",
-                confidence="medium",
-            )
-        return ServiceInfo(
-            name="unknown",
-            version="",
-            confidence="low",
-        )
-
     def grab_multiple(self, host: str, ports: list) -> list[Banner]:
         """Grab banners from multiple ports concurrently. Returns only successful results."""
         results = []
@@ -117,6 +93,42 @@ class BannerGrabber:
                 if result is not None:
                     results.append(result)
         return results
+
+    def fingerprint(self, banner: str) -> ServiceInfo:
+        """Map raw banner to ServiceInfo via pattern table. Input capped at 1024 bytes.
+
+        Patterns ordered by specificity — more specific patterns first.
+        Confidence: high = strong match, medium = partial, low = unknown.
+        """
+        if len(banner) > 1024:
+            banner = banner[:1024]
+
+        patterns = [
+            (r"SSH-(\d+\.\d+)-(\S+)", lambda m: ("ssh", m.group(1), "high")),
+            (
+                r"Server: (.+)|HTTP/\d\.\d \d+ .+ \| (.+)",
+                lambda m: ("http", "", "high"),
+            ),
+            (r"220[- ](.+?)(?:ESMTP|SMTP)", lambda m: ("smtp", "", "high")),
+            (r"\+OK (.+)", lambda m: ("pop3", "", "high")),
+            (r"\* OK (.+)", lambda m: ("imap", "", "high")),
+            (r"RFB (\d+\.\d+)", lambda m: ("vnc", m.group(1), "high")),
+            (r"Redis (\S+)", lambda m: ("redis", m.group(1), "high")),
+            (r"PostgreSQL (\S+)", lambda m: ("postgresql", m.group(1), "high")),
+            (r"(\d+\.\d+\.\d+-\w+)", lambda m: ("mysql", m.group(1), "high")),
+            (r"SMB|SAMBA", lambda m: ("smb", "", "medium")),
+            (r"login:|telnet|Welcome", lambda m: ("telnet", "", "medium")),
+            (r"\x03\x00", lambda m: ("rdp", "", "medium")),
+            (r"220[- ](.+)", lambda m: ("ftp", "", "medium")),
+        ]
+
+        for pattern, builder in patterns:
+            m = re.search(pattern, banner, re.IGNORECASE)
+            if m:
+                name, version, confidence = builder(m)
+                return ServiceInfo(name=name, version=version, confidence=confidence)
+
+        return ServiceInfo(name="unknown", version="", confidence="low")
 
 
 if __name__ == "__main__":

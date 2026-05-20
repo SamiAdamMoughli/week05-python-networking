@@ -1078,12 +1078,18 @@ class PortScannerV3:
         banner = ""
         state = "filtered"
         start = time.time()
+        service_name = ""
         try:
             result = sock.connect_ex((self.target, port))
             if result == 0:
                 state = "open"
                 grabbed = self.banner_grabber.grab(self.target, port)
-                banner = grabbed.raw_banner.strip() if grabbed else ""
+                if grabbed:
+                    banner = grabbed.raw_banner.strip()
+                    service_name = grabbed.service_name
+                else:
+                    service_name = ""
+                    banner = ""
             elif result == 111:
                 state = "closed"
             else:
@@ -1093,10 +1099,7 @@ class PortScannerV3:
         finally:
             scan_ms = (time.time() - start) * 1000
             sock.close()
-        try:
-            service_name = socket.getservbyport(port).split()[0]
-        except OSError:
-            service_name = ""
+
         if self.rate_limit:
             time.sleep(1 / self.rate_limit)
         return ScanResult(
