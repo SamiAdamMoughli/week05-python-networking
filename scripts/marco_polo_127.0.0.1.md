@@ -1,27 +1,21 @@
 # MarcoPolo Scan Report
 **Target:** 127.0.0.1
-**Open ports:** 6
-**Scanned at:** 2026-05-20T19:00:26.902825
+**Open ports:** 5
+**Scanned at:** 2026-05-20T19:48:23.510062
 
 ---
 
-**22** — ssh
-> SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.2
-_6.8ms_
+**53** — 
+_500.9ms_
 
-**631** — unknown
-_3.1ms_
+**67** — 
+_501.1ms_
 
-**3306** — mysql
-> MySQL 8.4.8-0ubuntu1 caching_sha2_password
-_10.2ms_
+**123** — 
+_500.5ms_
 
-**80** — http
-> HTTP/1.1 200 OK | Apache/2.4.66 (Ubuntu)
-_1.2ms_
+**161** — 
+_500.4ms_
 
-**49154** — 
-_1.5ms_
-
-**5432** — 
-_3011.3ms_
+**500** — 
+_500.9ms_

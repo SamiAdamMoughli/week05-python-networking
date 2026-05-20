@@ -38,6 +38,7 @@ class ScanResult:
 class PortScannerV3:
     """Concurrent TCP port scanner with banner grabbing and Rich output."""
 
+    UDP_PORTS = [53, 67, 123, 161, 500]
     TOP_PORTS = sorted(
         set(
             [
@@ -1110,6 +1111,57 @@ class PortScannerV3:
             scan_ms=scan_ms,
         )
 
+    def scan_udp_port(self, port: int) -> ScanResult:
+        """Send UDP datagram and infer port state from response.
+
+        UDP has no handshake — ambiguity is inherent:
+        - ICMP port unreachable (errno 111) → CLOSED — target explicitly rejected
+        - No response → OPEN|FILTERED — service may be listening or firewall dropped packet
+        - Cannot distinguish open from filtered without protocol-specific probes
+        """
+        start = time.time()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self.timeout)
+            sock.sendto(b"", (self.target, port))
+            try:
+                sock.recvfrom(1024)
+                state = "open"
+            except socket.timeout:
+                state = "open|filtered"
+            except ConnectionRefusedError:
+                state = "closed"
+        except OSError:
+            state = "filtered"
+        finally:
+            scan_ms = (time.time() - start) * 1000
+            sock.close()
+
+        return ScanResult(
+            port=port,
+            state=state,
+            service="",
+            banner="",
+            scan_ms=scan_ms,
+        )
+
+    def scan_udp(self) -> list[ScanResult]:
+        """Scan common UDP ports — DNS, DHCP, NTP, SNMP, IKE."""
+        results = []
+        formatter = NetworkFormatter()
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futures = {
+                ex.submit(self.scan_udp_port, port): port for port in self.UDP_PORTS
+            }
+            with formatter.progress_bar(total=len(self.UDP_PORTS)) as progress:
+                task = progress.add_task(
+                    f"scanning UDP {self.target}...", total=len(self.UDP_PORTS)
+                )
+                for future in as_completed(futures):
+                    results.append(future.result())
+                    progress.advance(task)
+        return [r for r in results if r.state != "closed"]
+
     def scan_range(self, start: int, end: int) -> list[ScanResult]:
         """Scan a port range concurrently. Returns only open results."""
         results = []
@@ -1196,6 +1248,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--target", required=True, help="Target IP or hostname.")
     parser.add_argument("--top", type=int, help="Scan top N ports.")
+    parser.add_argument("--udp", action="store_true", help="Scan common UDP ports.")
     parser.add_argument("--range", dest="port_range", help="Port range e.g. 1-1000.")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark mode.")
     args = parser.parse_args()
@@ -1222,6 +1275,14 @@ if __name__ == "__main__":
         start, end = map(int, args.port_range.split("-"))
         scanner = PortScannerV3(args.target)
         results = scanner.scan_range(start, end)
+        console.print(formatter.port_table(results))
+        report = scanner.generate_report(results)
+        with open(f"marco_polo_{args.target}.md", "w") as f:
+            f.write(report)
+        console.print(f"[grey66]report saved → marco_polo_{args.target}.md[/grey66]")
+    elif args.udp:
+        scanner = PortScannerV3(args.target)
+        results = scanner.scan_udp()
         console.print(formatter.port_table(results))
         report = scanner.generate_report(results)
         with open(f"marco_polo_{args.target}.md", "w") as f:
