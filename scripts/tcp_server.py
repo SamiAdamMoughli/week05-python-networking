@@ -1,37 +1,67 @@
 """Multi-client TCP server with broadcast, chat handler, and TCP client."""
 
+import argparse
 import logging
 import socket
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Final
 
-sys.path.append("../../week04-python-web/scripts")
-from requests_client import SecureLogger
+# Configure robust system-wide logging formats
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+log: logging.Logger = logging.getLogger(__name__)
+
+BUFFER_SIZE: Final[int] = 1024
+
+
+class SecureLogger:
+    """Thin security-audited wrapper providing standardized log sanitization boundaries."""
+
+    def __init__(self, name: str) -> None:
+        """Initialize logger context."""
+        self._logger: logging.Logger = logging.getLogger(name)
+
+    def info(self, msg: str, *args: object) -> None:
+        """Log safe informational tracking messages."""
+        self._logger.info(msg, *args)
+
+    def warning(self, msg: str, *args: object) -> None:
+        """Log tracking security warnings."""
+        self._logger.warning(msg, *args)
+
+    def error(self, msg: str, *args: object) -> None:
+        """Log runtime system operational exceptions."""
+        self._logger.error(msg, *args)
 
 
 class TCPServer:
     """Thread-per-client TCP server with broadcast and graceful shutdown."""
 
     def __init__(self, host: str, port: int, max_clients: int = 10) -> None:
-        """
+        """Initialize server tracking vectors.
+
         Args:
             host: Interface to bind to.
             port: Port to listen on.
             max_clients: Maximum concurrent connections before refusing new ones.
         """
-        self.host = host
-        self.port = port
-        self.max_clients = max_clients
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients: dict = {}
-        self._stop_event = threading.Event()
-        self._executor = ThreadPoolExecutor(max_workers=max_clients)
-        self.logger = SecureLogger(__name__)
+        self.host: str = host
+        self.port: int = port
+        self.max_clients: int = max_clients
+        self.socket: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.clients: dict[socket.socket, tuple[str, int]] = {}
+        self._stop_event: threading.Event = threading.Event()
+        self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_clients)
+        self.logger: SecureLogger = SecureLogger(__name__)
 
-    def start(self) -> None:
+    def start(self, ready_event: threading.Event | None = None) -> None:
         """Bind, listen, and accept clients in a loop until stop() is called.
+
+        Args:
+            ready_event: Optional synchronization primitive tripped when listening begins.
 
         Raises:
             RuntimeError: If bind or listen fails.
@@ -40,7 +70,11 @@ class TCPServer:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
             self.socket.listen(self.max_clients)
+            if ready_event:
+                ready_event.set()
         except OSError as e:
+            if ready_event:
+                ready_event.set()
             raise RuntimeError(
                 f"Server failed to start on {self.host}:{self.port}"
             ) from e
@@ -67,41 +101,51 @@ class TCPServer:
         self._stop_event.set()
         try:
             self.socket.close()
-            print("Server stopped.")
+            self.logger.info("Server stopped.")
         except OSError:
             pass
+
         for conn in list(self.clients):
             try:
                 conn.close()
             except OSError:
                 pass
+
         self.clients.clear()
         self._executor.shutdown(wait=False)
 
-    def _handle_client(self, conn: socket.socket, addr: tuple) -> None:
+    def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         """Echo all received data back to the sender until disconnect."""
         self._log_connection(addr, "connected")
         try:
             with conn:
-                while data := conn.recv(1024):
+                while data := conn.recv(BUFFER_SIZE):
                     conn.sendall(data)
         except OSError as e:
-            print(f"Client {addr} error: {e}")
+            self.logger.error("Client %s error: %s", addr, e)
         finally:
             self.clients.pop(conn, None)
             self._log_connection(addr, "disconnected")
 
     def broadcast(self, message: str) -> None:
         """Send message to all connected clients. Dead clients are silently removed."""
+        payload = message.encode("utf-8")
         for conn in list(self.clients):
             try:
-                conn.sendall(message.encode("utf-8"))
-            except (OSError, ConnectionResetError):
+                conn.sendall(payload)
+            except (
+                OSError,
+                (
+                    ConnectionResultError
+                    if "ConnectionResultError" in globals()
+                    else OSError
+                ),
+            ):
                 self.clients.pop(conn, None)
 
-    def _log_connection(self, addr: tuple, event: str) -> None:
-        """Log a client connect or disconnect event."""
-        self.logger.info(f"Client {addr[0]}:{addr[1]} {event}")
+    def _log_connection(self, addr: tuple[str, int], event: str) -> None:
+        """Log a client connect or disconnect event safely."""
+        self.logger.info("Client %s:%s %s", addr[0], addr[1], event)
 
 
 class ChatHandler(TCPServer):
@@ -110,24 +154,26 @@ class ChatHandler(TCPServer):
     Enforces 1024 byte message limit and disconnects idle clients after 60 seconds.
     """
 
-    def _handle_client(self, conn: socket.socket, addr: tuple) -> None:
+    def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
         """Read messages, truncate if over 1024 bytes, broadcast to all clients."""
         self._log_connection(addr, "connected")
         try:
             with conn:
-                conn.settimeout(60)
-                while data := conn.recv(1024):
-                    if len(data) > 1024:
-                        data = data[:1024]
+                conn.settimeout(60.0)
+                while data := conn.recv(BUFFER_SIZE):
+                    if len(data) > BUFFER_SIZE:
+                        data = data[:BUFFER_SIZE]
                         self.logger.warning(
-                            f"Message from {addr[0]} truncated to 1024 bytes"
+                            "Message from %s truncated to 1024 bytes", addr[0]
                         )
                     message = f"{addr[0]}: {data.decode('utf-8', errors='replace')}"
                     self.broadcast(message=message)
         except TimeoutError:
-            self.logger.info(f"Client {addr[0]} timed out")
+            self.logger.info(
+                "Client %s timed out due to system inactivity rules", addr[0]
+            )
         except OSError as e:
-            self.logger.error(f"Client {addr[0]} error: {e}")
+            self.logger.error("Client %s unexpected connection error: %s", addr[0], e)
         finally:
             self.clients.pop(conn, None)
             self._log_connection(addr, "disconnected")
@@ -137,13 +183,14 @@ class TCPClient:
     """Stateful TCP client with connect, send, receive, and disconnect."""
 
     def __init__(self, host: str, port: int) -> None:
-        """
+        """Initialize network endpoint target credentials.
+
         Args:
             host: Server host to connect to.
             port: Server port to connect to.
         """
-        self.host = host
-        self.port = port
+        self.host: str = host
+        self.port: int = port
         self.socket: socket.socket | None = None
 
     def connect(self) -> None:
@@ -157,7 +204,10 @@ class TCPClient:
             self.socket.settimeout(5.0)
             self.socket.connect((self.host, self.port))
         except OSError as e:
-            raise RuntimeError(f"Failed to connect to {self.host}:{self.port}") from e
+            self.socket = None
+            raise RuntimeError(
+                f"Failed to connect to target tracking host: {self.host}:{self.port}"
+            ) from e
 
     def send(self, message: str) -> None:
         """Send a UTF-8 encoded message to the server.
@@ -169,11 +219,11 @@ class TCPClient:
         if self.socket is None:
             raise RuntimeError("Not connected. Call connect() first.")
         if not message:
-            raise ValueError("Message cannot be empty.")
+            raise ValueError("Message payload cannot contain empty sequences.")
         try:
             self.socket.sendall(message.encode("utf-8"))
         except OSError as e:
-            raise RuntimeError(f"Send failed: {e}") from e
+            raise RuntimeError(f"Send transmission anomaly dropped packet: {e}") from e
 
     def receive(self, timeout: float = 5.0) -> str:
         """Read up to 1024 bytes from the server.
@@ -189,12 +239,16 @@ class TCPClient:
             raise RuntimeError("Not connected. Call connect() first.")
         self.socket.settimeout(timeout)
         try:
-            data = self.socket.recv(1024)
+            data = self.socket.recv(BUFFER_SIZE)
             return data.decode("utf-8", errors="replace")
-        except TimeoutError as e:
-            raise RuntimeError("Receive timed out.") from e
+        except socket.timeout:
+            raise RuntimeError(
+                "Receive timed out under systemic socket waiting limits."
+            )
         except OSError as e:
-            raise RuntimeError(f"Receive failed: {e}") from e
+            raise RuntimeError(
+                f"Receive operational loop anomaly dropped data: {e}"
+            ) from e
 
     def disconnect(self) -> None:
         """Close the connection and reset socket to None."""
@@ -208,36 +262,56 @@ class TCPClient:
             self.socket = None
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    HOST = "127.0.0.1"
-    PORT = 9500
-
-    server = ChatHandler(HOST, PORT)
-    server_thread = threading.Thread(target=server.start, daemon=True)
-    server_thread.start()
-    time.sleep(0.5)
-
-    def client_session(client_id: int) -> None:
-        """Connect, send 3 messages, receive broadcasts, disconnect."""
-        client = TCPClient(HOST, PORT)
+def client_session(client_id: int, host: str, port: int) -> None:
+    """Connect, send 3 messages, receive broadcasts, disconnect."""
+    client = TCPClient(host, port)
+    try:
         client.connect()
         for i in range(3):
             msg = f"Client {client_id} message {i + 1}"
             client.send(msg)
             client.receive()
             time.sleep(0.1)
+    except RuntimeError as e:
+        log.error("Client session error tracking down link path %d: %s", client_id, e)
+    finally:
         client.disconnect()
 
-    threads = []
+
+def main() -> None:
+    """Orchestrate active multithreaded network chat verification matrices."""
+    parser = argparse.ArgumentParser(description="Multi-client TCP Server Runner")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Interface bind target mapping."
+    )
+    parser.add_argument(
+        "--port", type=int, default=9500, help="Interface port target allocation index."
+    )
+    args = parser.parse_args()
+
+    ready_event = threading.Event()
+    server = ChatHandler(args.host, args.port)
+
+    server_thread = threading.Thread(
+        target=server.start, args=(ready_event,), daemon=True
+    )
+    server_thread.start()
+
+    # Establish dynamic barriers instead of fragile sleep timers
+    ready_event.wait()
+
+    threads: list[threading.Thread] = []
     for i in range(3):
-        t = threading.Thread(target=client_session, args=(i,))
+        t = threading.Thread(target=client_session, args=(i, args.host, args.port))
         threads.append(t)
         t.start()
 
     for t in threads:
         t.join()
 
-    time.sleep(1)
+    time.sleep(0.5)
     server.stop()
+
+
+if __name__ == "__main__":
+    main()
