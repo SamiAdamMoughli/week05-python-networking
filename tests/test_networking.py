@@ -1,15 +1,22 @@
 """Tests for Week 5 networking tools."""
-import sys
-import os
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
+import os
+import sys
+
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+)
 
 import threading
+
 import pytest
 from banner_grabber import BannerGrabber  # pylint: disable=import-error
 from marco_polo import PortScannerV3, ScanResult  # pylint: disable=import-error
 from pcap_analyser import PCAPAnalyser  # pylint: disable=import-error
-from socket_fundamentals import run_tcp_server, run_tcp_client  # pylint: disable=import-error
+from socket_fundamentals import (  # pylint: disable=import-error
+    run_tcp_client,
+    run_tcp_server,
+)
 
 
 class TestTCPEcho:
@@ -72,8 +79,10 @@ class TestPCAPAnalyser:
     PCAP_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "capture.pcap")
 
     @pytest.mark.skipif(
-        not os.path.exists(os.path.join(os.path.dirname(__file__), "..", "data", "capture.pcap")),
-        reason="capture.pcap not present"
+        not os.path.exists(
+            os.path.join(os.path.dirname(__file__), "..", "data", "capture.pcap")
+        ),
+        reason="capture.pcap not present",
     )
     def test_load_returns_packets(self) -> None:
         """load() returns a non-empty list."""
@@ -82,8 +91,10 @@ class TestPCAPAnalyser:
         assert len(packets) > 0
 
     @pytest.mark.skipif(
-        not os.path.exists(os.path.join(os.path.dirname(__file__), "..", "data", "capture.pcap")),
-        reason="capture.pcap not present"
+        not os.path.exists(
+            os.path.join(os.path.dirname(__file__), "..", "data", "capture.pcap")
+        ),
+        reason="capture.pcap not present",
     )
     def test_protocol_breakdown_has_tcp(self) -> None:
         """protocol_breakdown() returns dict with TCP key."""

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Final
 
+import scapy.all as scapy  # Clean namespace tracking to ensure type consistency
 from rich import box
 from rich.console import Console
 from rich.layout import Layout
@@ -28,7 +29,6 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-import scapy.all as scapy  # Clean namespace tracking to ensure type consistency
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log: logging.Logger = logging.getLogger(__name__)

@@ -232,8 +232,8 @@ def cmd_grab(args: argparse.Namespace) -> None:
 def cmd_sniff(args: argparse.Namespace) -> None:
     """Capture interface packets safely via structural Scapy wrappers."""
     try:
-        from packet_sniffer import PacketSniffer  # type: ignore[import-not-found]
         from network_formatter import NetworkFormatter  # type: ignore[import-not-found]
+        from packet_sniffer import PacketSniffer  # type: ignore[import-not-found]
     except ImportError as e:
         abort(f"Could not load packet sniffing components: {e}")
 
