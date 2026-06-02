@@ -2,6 +2,12 @@
 
 Provides an automated processing pipeline to ingest raw network frame captures
 and extract operational traffic metrics, application signatures, and flow baselines.
+
+ETHICAL USE NOTICE:
+This tool is intended for authorized security testing, forensic tracking, and
+educational auditing purposes only. Analyzing network artifacts or traffic capture
+traces without explicit, prior, written permission from the asset owner may be illegal
+in your jurisdiction. The author assumes no responsibility for misuse.
 """
 
 # pylint: disable=no-member
@@ -9,6 +15,7 @@ and extract operational traffic metrics, application signatures, and flow baseli
 import argparse
 import logging
 import os
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -21,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_DISPLAY_LIMIT: Final[int] = 10
+MAX_HEADER_BODY_READ_BYTES: Final[int] = 4096
 
 
 @dataclass
@@ -61,14 +69,7 @@ class TimelineEntry(NamedTuple):
 
 
 def _infer_packet_protocol(pkt: scapy.Packet) -> str:
-    """Evaluate packet properties to determine its abstract network classification.
-
-    Args:
-        pkt: Target Scapy frame handle.
-
-    Returns:
-        String identifying the network protocol structure ('TCP', 'UDP', 'ICMP', or 'Other').
-    """
+    """Evaluate packet properties to determine its abstract network classification."""
     if pkt.haslayer(scapy.TCP):
         return "TCP"
     if pkt.haslayer(scapy.UDP):
@@ -81,54 +82,52 @@ def _infer_packet_protocol(pkt: scapy.Packet) -> str:
 class PCAPAnalyser:
     """Ingestion and metadata processing engine for network trace files."""
 
+    # Sensitive header filtering expressions
+    _SENSITIVE_DATA_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+        re.compile(
+            r"(?:sessionid|cookie|set-cookie|authorization|bearer|token|passwd|password)\s*=\s*\S+",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:authorization|proxy-authorization):\s*\S+", re.IGNORECASE),
+    )
+
     def __init__(self) -> None:
         """Initialize core engine collection properties."""
         self.packets: list[scapy.Packet] = []
 
+    def _sanitize_header_value(self, raw_value: str) -> str:
+        """Strip critical cookie assets or authorization sequences from header strings."""
+        sanitized = raw_value
+        for pattern in self._SENSITIVE_DATA_PATTERNS:
+            sanitized = pattern.sub("[REDACTED_SENSITIVE_FIELD]", sanitized)
+        return sanitized
+
     def load(self, filepath: str) -> list[scapy.Packet]:
-        """Read standard PCAP binary structures from disk into local memory buffers.
+        """Read standard PCAP binary structures from disk into local memory buffers."""
+        # Enforce canonical path checking loops to protect host filesystem layout spaces
+        canonical_path = os.path.realpath(filepath)
+        if not os.path.exists(canonical_path):
+            raise FileNotFoundError(
+                f"Target PCAP data stream path cannot be found: {canonical_path}"
+            )
 
-        Args:
-            filepath: Target absolute or relative location reference path string.
-
-        Returns:
-            A list containing hydrated Scapy packet elements.
-        """
-        self.packets = list(scapy.rdpcap(filepath))
+        self.packets = list(scapy.rdpcap(canonical_path))
         return self.packets
 
     def top_talkers(self, n: int = DEFAULT_DISPLAY_LIMIT) -> list[tuple[str, int]]:
-        """Identify layer-3 interfaces emitting the highest transmission frame totals.
-
-        Args:
-            n: Restrict output evaluation bounds to the top N entries.
-
-        Returns:
-            List containing pairing records corresponding to (Source IP, Packet Count).
-        """
+        """Identify layer-3 interfaces emitting the highest transmission frame totals."""
         sources = [pkt[scapy.IP].src for pkt in self.packets if pkt.haslayer(scapy.IP)]
         return Counter(sources).most_common(n)
 
     def top_destinations(self, n: int = DEFAULT_DISPLAY_LIMIT) -> list[tuple[str, int]]:
-        """Identify layer-3 interfaces receiving the highest transmission frame totals.
-
-        Args:
-            n: Restrict output evaluation bounds to the top N entries.
-
-        Returns:
-            List containing pairing records corresponding to (Destination IP, Packet Count).
-        """
+        """Identify layer-3 interfaces receiving the highest transmission frame totals."""
         destinations = [
             pkt[scapy.IP].dst for pkt in self.packets if pkt.haslayer(scapy.IP)
         ]
         return Counter(destinations).most_common(n)
 
     def protocol_breakdown(self) -> dict[str, int]:
-        """Calculate traffic classification profile distributions over the buffer.
-
-        Returns:
-            Dictionary mapped by layer-4 tracking profile labels and their associated totals.
-        """
+        """Calculate traffic classification profile distributions over the buffer."""
         breakdown = {"TCP": 0, "UDP": 0, "ICMP": 0, "Other": 0}
         for pkt in self.packets:
             proto = _infer_packet_protocol(pkt)
@@ -136,11 +135,7 @@ class PCAPAnalyser:
         return breakdown
 
     def port_breakdown(self) -> dict[int, int]:
-        """Evaluate network port activity across layer-4 transport protocols.
-
-        Returns:
-            Sorted counter sequence map matching active destination port indexes against totals.
-        """
+        """Evaluate network port activity across layer-4 transport protocols."""
         ports: list[int] = []
         for pkt in self.packets:
             if pkt.haslayer(scapy.TCP):
@@ -150,11 +145,7 @@ class PCAPAnalyser:
         return dict(Counter(ports).most_common(DEFAULT_DISPLAY_LIMIT))
 
     def tcp_conversations(self) -> list[Conversation]:
-        """Assemble individual sequential stream tracking segments from raw arrays.
-
-        Returns:
-            List filled with uniquely aggregated flow conversation details.
-        """
+        """Assemble individual sequential stream tracking segments from raw arrays."""
         groups: dict[tuple[str, int, str, int], ConversationGroup] = {}
 
         for pkt in self.packets:
@@ -172,7 +163,6 @@ class PCAPAnalyser:
                 groups[key] = ConversationGroup(packets=[], bytes_total=0)
 
             groups[key].packets.append(pkt)
-            # Reconstruct the tracking tuple cleanly with updated byte values
             groups[key] = groups[key]._replace(
                 bytes_total=groups[key].bytes_total + len(pkt)
             )
@@ -180,6 +170,8 @@ class PCAPAnalyser:
         conversations: list[Conversation] = []
         for (src_ip, src_port, dst_ip, dst_port), data in groups.items():
             pkts = data.packets
+            if not pkts:
+                continue
             duration = (float(pkts[-1].time) - float(pkts[0].time)) * 1000
             conversations.append(
                 Conversation(
@@ -195,18 +187,18 @@ class PCAPAnalyser:
         return conversations
 
     def find_http_requests(self) -> list[dict[str, str | None]]:
-        """Parse raw stream buffer strings to isolate application layer HTTP components.
-
-        Returns:
-            List containing dictionary maps with keys describing metadata characteristics.
-        """
+        """Parse raw stream buffer strings to isolate application layer HTTP components."""
         requests: list[dict[str, str | None]] = []
         for pkt in self.packets:
             if not pkt.haslayer(scapy.TCP) or not pkt.haslayer(scapy.Raw):
                 continue
 
-            payload = pkt[scapy.Raw].load.decode(errors="ignore")
-            if not payload.startswith(("GET", "POST", "PUT", "DELETE")):
+            # Bound buffer slicing lengths to avert algorithmic exhaustion on heavy payloads
+            raw_payload = pkt[scapy.Raw].load[:MAX_HEADER_BODY_READ_BYTES]
+            payload = raw_payload.decode(errors="ignore")
+            if not payload.startswith(
+                ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS")
+            ):
                 continue
 
             lines = payload.split("\r\n")
@@ -223,23 +215,23 @@ class PCAPAnalyser:
                     key, value = line.split(": ", 1)
                     headers[key.strip()] = value.strip()
 
+            # Pass variables through validation wrappers to isolate token footprints
+            host = self._sanitize_header_value(headers.get("Host", ""))
+            user_agent = self._sanitize_header_value(headers.get("User-Agent", ""))
+
             requests.append(
                 {
                     "method": method,
                     "path": path,
-                    "host": headers.get("Host"),
-                    "user_agent": headers.get("User-Agent"),
+                    "host": host if host else None,
+                    "user_agent": user_agent if user_agent else None,
                     "src": pkt[scapy.IP].src if pkt.haslayer(scapy.IP) else None,
                 }
             )
         return requests
 
     def find_dns_queries(self) -> list[dict[str, object]]:
-        """Deconstruct active domain resolution interactions inside the capture data.
-
-        Returns:
-            List detailing standard resolution information objects.
-        """
+        """Deconstruct active domain resolution interactions inside the capture data."""
         queries: list[dict[str, object]] = []
         for pkt in self.packets:
             if not pkt.haslayer(scapy.DNS) or not pkt[scapy.DNS].qd:
@@ -267,11 +259,7 @@ class PCAPAnalyser:
         return queries
 
     def timeline(self) -> list[TimelineEntry]:
-        """Sequence capture frame histories linearly across an ordered chronological spectrum.
-
-        Returns:
-            A sorted collection list of timeline snapshot sequence entries.
-        """
+        """Sequence capture frame histories linearly across an ordered chronological spectrum."""
         result: list[TimelineEntry] = []
         for pkt in self.packets:
             if not pkt.haslayer(scapy.IP):
@@ -288,11 +276,7 @@ class PCAPAnalyser:
         return sorted(result, key=lambda entry: entry.timestamp)
 
     def generate_report(self) -> str:
-        """Compile internal processed metrics summaries into readable Markdown records.
-
-        Returns:
-            A string payload structured in plain Markdown markdown notation.
-        """
+        """Compile internal processed metrics summaries into readable Markdown records."""
         report: list[str] = ["# PCAP Analysis Report\n", "## Top Talkers"]
         for ip, count in self.top_talkers():
             report.append(f"- {ip}: {count} packets")
@@ -349,19 +333,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not os.path.isfile(args.file):
-        log.error(
-            "The specified target trace path was invalid or cannot be resolved: %s",
-            args.file,
-        )
-        sys.exit(1)
-
     analyser = PCAPAnalyser()
 
     try:
         analyser.load(args.file)
     except (FileNotFoundError, PermissionError) as error:
-        log.error("Failed to read system file data cleanly: %s", error)
+        log.error("Failed to safely access or parse target trace framework: %s", error)
         sys.exit(1)
 
     if args.report:

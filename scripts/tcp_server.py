@@ -1,4 +1,12 @@
-"""Multi-client TCP server with broadcast, chat handler, and TCP client."""
+"""Multi-client TCP server with broadcast, chat handler, and TCP client.
+
+ETHICAL USE NOTICE:
+This tool is intended for authorized security testing, infrastructure resilience
+auditing, and educational development purposes only. Running multi-client servers
+or intercepting distributed system data without explicit, prior, written permission
+from the corporate network or system owner may be illegal in your jurisdiction.
+The author assumes no responsibility for misuse or operational disruption.
+"""
 
 import argparse
 import logging
@@ -10,7 +18,7 @@ from typing import Final
 
 # Configure robust system-wide logging formats
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -53,6 +61,7 @@ class TCPServer:
         self.max_clients: int = max_clients
         self.socket: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.clients: dict[socket.socket, tuple[str, int]] = {}
+        self.clients_lock: threading.Lock = threading.Lock()
         self._stop_event: threading.Event = threading.Event()
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_clients)
         self.logger: SecureLogger = SecureLogger(__name__)
@@ -83,11 +92,17 @@ class TCPServer:
             while not self._stop_event.is_set():
                 try:
                     conn, addr = self.socket.accept()
-                    if len(self.clients) >= self.max_clients:
-                        conn.sendall(b"Server full. Try again later.")
-                        conn.close()
-                        continue
-                    self.clients[conn] = addr
+
+                    with self.clients_lock:
+                        if len(self.clients) >= self.max_clients:
+                            try:
+                                conn.sendall(b"Server full. Try again later.")
+                            except OSError:
+                                pass
+                            conn.close()
+                            continue
+                        self.clients[conn] = addr
+
                     self._executor.submit(self._handle_client, conn, addr)
                 except OSError:
                     if self._stop_event.is_set():
@@ -105,13 +120,14 @@ class TCPServer:
         except OSError:
             pass
 
-        for conn in list(self.clients):
-            try:
-                conn.close()
-            except OSError:
-                pass
+        with self.clients_lock:
+            for conn in list(self.clients):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            self.clients.clear()
 
-        self.clients.clear()
         self._executor.shutdown(wait=False)
 
     def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
@@ -119,29 +135,31 @@ class TCPServer:
         self._log_connection(addr, "connected")
         try:
             with conn:
-                while data := conn.recv(BUFFER_SIZE):
+                while not self._stop_event.is_set():
+                    data = conn.recv(BUFFER_SIZE)
+                    if not data:
+                        break
                     conn.sendall(data)
         except OSError as e:
             self.logger.error("Client %s error: %s", addr, e)
         finally:
-            self.clients.pop(conn, None)
+            with self.clients_lock:
+                self.clients.pop(conn, None)
             self._log_connection(addr, "disconnected")
 
     def broadcast(self, message: str) -> None:
         """Send message to all connected clients. Dead clients are silently removed."""
         payload = message.encode("utf-8")
-        for conn in list(self.clients):
+
+        with self.clients_lock:
+            active_targets = list(self.clients.keys())
+
+        for conn in active_targets:
             try:
                 conn.sendall(payload)
-            except (
-                OSError,
-                (
-                    ConnectionResultError
-                    if "ConnectionResultError" in globals()
-                    else OSError
-                ),
-            ):
-                self.clients.pop(conn, None)
+            except OSError:
+                with self.clients_lock:
+                    self.clients.pop(conn, None)
 
     def _log_connection(self, addr: tuple[str, int], event: str) -> None:
         """Log a client connect or disconnect event safely."""
@@ -160,12 +178,18 @@ class ChatHandler(TCPServer):
         try:
             with conn:
                 conn.settimeout(60.0)
-                while data := conn.recv(BUFFER_SIZE):
-                    if len(data) > BUFFER_SIZE:
+                while not self._stop_event.is_set():
+                    data = conn.recv(BUFFER_SIZE)
+                    if not data:
+                        break
+
+                    if len(data) >= BUFFER_SIZE:
                         data = data[:BUFFER_SIZE]
                         self.logger.warning(
-                            "Message from %s truncated to 1024 bytes", addr[0]
+                            "Incoming frame buffer threshold met. Slicing data payload from address: %s",
+                            addr[0],
                         )
+
                     message = f"{addr[0]}: {data.decode('utf-8', errors='replace')}"
                     self.broadcast(message=message)
         except TimeoutError:
@@ -175,7 +199,8 @@ class ChatHandler(TCPServer):
         except OSError as e:
             self.logger.error("Client %s unexpected connection error: %s", addr[0], e)
         finally:
-            self.clients.pop(conn, None)
+            with self.clients_lock:
+                self.clients.pop(conn, None)
             self._log_connection(addr, "disconnected")
 
 
@@ -270,7 +295,10 @@ def client_session(client_id: int, host: str, port: int) -> None:
         for i in range(3):
             msg = f"Client {client_id} message {i + 1}"
             client.send(msg)
-            client.receive()
+            try:
+                client.receive(timeout=1.0)
+            except RuntimeError:
+                pass
             time.sleep(0.1)
     except RuntimeError as e:
         log.error("Client session error tracking down link path %d: %s", client_id, e)
@@ -290,14 +318,12 @@ def main() -> None:
     args = parser.parse_args()
 
     ready_event = threading.Event()
-    server = ChatHandler(args.host, args.port)
+    server = ChatHandler(args.host, args.port, max_clients=5)
 
     server_thread = threading.Thread(
         target=server.start, args=(ready_event,), daemon=True
     )
     server_thread.start()
-
-    # Establish dynamic barriers instead of fragile sleep timers
     ready_event.wait()
 
     threads: list[threading.Thread] = []

@@ -1,6 +1,11 @@
-"""Terminal output formatter using Rich — tables, panels, and progress for all network tools."""
+"""Terminal output formatter using Rich — tables, panels, and progress for all network tools.
 
-import sys
+Provides consistent console rendering configurations, interactive progress bars,
+and beautifully styled tabular summaries for network diagnostics.
+"""
+
+# pylint: disable=too-few-public-methods
+
 import time
 from dataclasses import dataclass
 from typing import ClassVar, Final, Literal, Protocol, TypedDict
@@ -12,7 +17,6 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 
-# Structural protocol schemas matching upstream models without creating circular import rings
 class ScanResultLike(Protocol):
     """Protocol matching standard port scan results data layouts."""
 
@@ -101,11 +105,13 @@ class NetworkFormatter:
         table.add_column("confidence", justify="left")
 
         for banner in banners:
-            confidence_style = (
-                self.OPEN
-                if banner.confidence == "high"
-                else self.FILTERED if banner.confidence == "medium" else self.DIM
-            )
+            if banner.confidence == "high":
+                confidence_style = self.OPEN
+            elif banner.confidence == "medium":
+                confidence_style = self.FILTERED
+            else:
+                confidence_style = self.DIM
+
             table.add_row(
                 str(banner.port),
                 banner.service_name,
@@ -142,6 +148,8 @@ class NetworkFormatter:
 
     def progress_bar(self, total: int) -> Progress:
         """Return a styled Rich Progress context manager — caller controls the loop."""
+        # Note: 'total' parameter is preserved to support future multi-task configuration setups.
+        _ = total
         return Progress(
             SpinnerColumn(style=self.ACCENT),
             TextColumn(f"[{self.ACCENT}]{{task.description}}"),
@@ -177,7 +185,7 @@ def main() -> None:
 
     @dataclass(frozen=True)
     class MockBanner:
-        """Mock baseline matching structural data profiles for banners under verification."""
+        """Mock baseline matching structural data profiles for banners."""
 
         port: int
         service_name: str
@@ -186,7 +194,7 @@ def main() -> None:
 
     @dataclass(frozen=True)
     class MockScan:
-        """Mock baseline matching structural data profiles for scans under verification."""
+        """Mock baseline matching structural data profiles for scans."""
 
         port: int
         state: Literal["open", "closed", "filtered", "open|filtered"]
@@ -243,11 +251,10 @@ def main() -> None:
     console.print()
 
     with formatter.progress_bar(total=20) as progress:
-        if hasattr(progress, "add_task"):
-            task = progress.add_task("scanning...", total=20)
-            for _ in range(20):
-                time.sleep(0.02)
-                progress.advance(task)
+        task = progress.add_task("scanning...", total=20)
+        for _ in range(20):
+            time.sleep(0.02)
+            progress.advance(task)
 
     console.print()
     formatter.print_panel("done", "all formatters verified.")

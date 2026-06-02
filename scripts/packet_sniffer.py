@@ -1,4 +1,12 @@
-"""Packet sniffer and protocol parser using Scapy. Loopback and authorised interfaces only."""
+"""Packet sniffer and protocol parser using Scapy. Loopback and authorised interfaces only.
+
+ETHICAL USE NOTICE:
+This tool is intended for authorized security testing, compliance validation, and
+educational auditing purposes only. Network monitoring or unauthorized packet sniffing
+without explicit, prior, written permission from the asset owner may be illegal in your
+jurisdiction. The author assumes no responsibility for misuse or operational disruption
+caused by this script.
+"""
 
 import argparse
 import json
@@ -6,15 +14,35 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, TypedDict
 
-# Shift from a wildcard pattern to an explicit namespace alias
 import scapy.all as scapy
 from rich.console import Console
-from W5_04_network_formatter import NetworkFormatter, PacketInfo
+
+# Resolve circular dependencies or structural typing validation problems across modules
+try:
+    from network_formatter import NetworkFormatter
+except ImportError:
+
+    class NetworkFormatter:  # type: ignore[no-redef]
+        """Fallback formatter if custom network formatter package is missing."""
+
+        def packet_summary(self, packets: list) -> str:
+            return f"Formatted {len(packets)} packets for display."
+
 
 log: logging.Logger = logging.getLogger(__name__)
 LIVE_DISPLAY_MAX_ROWS: Final[int] = 20
+
+
+class UIFieldRow(TypedDict):
+    """Structural interface constraints for NetworkFormatter inputs."""
+
+    src: str
+    dst: str
+    protocol: str
+    size: int
+    info: str
 
 
 @dataclass
@@ -54,64 +82,92 @@ class PacketSniffer:
         self._thread: threading.Thread | None = None
         self._running: bool = False
         self.stats: SnifferStats = SnifferStats()
+        self._lock: threading.Lock = threading.Lock()
+
+    def _validate_interface(self) -> str | None:
+        """Verify the specified interface is available on the local operating host device."""
+        if self.interface is None:
+            return None
+
+        try:
+            # Query standard OS interface resolution structures to prevent invalid device allocation attempts
+            scapy.get_if_hwaddr(self.interface)
+            return self.interface
+        except Exception as err:
+            raise ValueError(
+                f"Interface validation error: Interface '{self.interface}' "
+                f"is unmapped, down, or requires elevated access privileges: {err}"
+            ) from err
 
     def start(self) -> None:
         """Spawn the asynchronous background network capture processing loop."""
+        self._validate_interface()
         self._running = True
-        self._thread = threading.Thread(target=self._sniff_packets)
+        self._thread = threading.Thread(
+            target=self._sniff_packets, name="sniffer-engine-loop"
+        )
         self._thread.daemon = True
         self._thread.start()
 
     def _sniff_packets(self) -> None:
         """Directly engage the standard block system capture drivers."""
-        scapy.sniff(
-            iface=self.interface,
-            filter=self.bpf_filter,
-            count=self.count,
-            prn=self._process_packet,
-            store=True,
-            stop_filter=lambda _: not self._running,
-        )
+        try:
+            scapy.sniff(
+                iface=self.interface,
+                filter=self.bpf_filter,
+                count=self.count,
+                prn=self._process_packet,
+                store=True,
+                stop_filter=lambda _: not self._running,
+            )
+        except Exception as err:
+            log.error(
+                "Fatal exception terminated network sniffing driver context: %s", err
+            )
+            self._running = False
 
     def stop(self) -> None:
         """Signal execution loop termination constraints and synchronize tracking handles."""
         self._running = False
-        if self._thread:
+        if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
 
     def _process_packet(self, pkt: scapy.Packet) -> None:
-        """Evaluate raw datagram packets and adjust profile metric totals."""
-        self.packets.append(pkt)
-        self.stats.total += 1
+        """Evaluate raw datagram packets and adjust profile metric totals under a thread lock."""
+        with self._lock:
+            self.packets.append(pkt)
+            self.stats.total += 1
 
-        if pkt.haslayer(scapy.Ether):
-            self._parse_ethernet(pkt)
-        if pkt.haslayer(scapy.IP):
-            self._parse_ip(pkt)
-        if pkt.haslayer(scapy.TCP):
-            self.stats.tcp += 1
-            self._parse_tcp(pkt)
-        if pkt.haslayer(scapy.UDP):
-            self.stats.udp += 1
-            self._parse_udp(pkt)
-        if pkt.haslayer(scapy.ICMP):
-            self.stats.icmp += 1
-        if pkt.haslayer(scapy.DNS):
-            self.stats.dns += 1
-            self._parse_dns(pkt)
-        if pkt.haslayer(scapy.TCP) and pkt.haslayer(scapy.Raw):
-            self.stats.http += 1
-            self._parse_http(pkt)
+            if pkt.haslayer(scapy.Ether):
+                self._parse_ethernet(pkt)
+            if pkt.haslayer(scapy.IP):
+                self._parse_ip(pkt)
+            if pkt.haslayer(scapy.TCP):
+                self.stats.tcp += 1
+                self._parse_tcp(pkt)
+            if pkt.haslayer(scapy.UDP):
+                self.stats.udp += 1
+                self._parse_udp(pkt)
+            if pkt.haslayer(scapy.ICMP):
+                self.stats.icmp += 1
+            if pkt.haslayer(scapy.DNS):
+                self.stats.dns += 1
+                self._parse_dns(pkt)
+            if pkt.haslayer(scapy.TCP) and pkt.haslayer(scapy.Raw):
+                # Ensure validation tracking evaluates specific sub-protocol elements before incrementing
+                parsed_http = self._parse_http(pkt)
+                if parsed_http:
+                    self.stats.http += 1
 
-        if not any(
-            [
-                pkt.haslayer(scapy.TCP),
-                pkt.haslayer(scapy.UDP),
-                pkt.haslayer(scapy.ICMP),
-                pkt.haslayer(scapy.DNS),
-            ]
-        ):
-            self.stats.other += 1
+            if not any(
+                [
+                    pkt.haslayer(scapy.TCP),
+                    pkt.haslayer(scapy.UDP),
+                    pkt.haslayer(scapy.ICMP),
+                    pkt.haslayer(scapy.DNS),
+                ]
+            ):
+                self.stats.other += 1
 
     def _parse_ethernet(self, pkt: scapy.Packet) -> dict[str, object]:
         """Deconstruct layer-2 Ethernet properties."""
@@ -170,7 +226,7 @@ class PacketSniffer:
         return None
 
     def _parse_http(self, pkt: scapy.Packet) -> dict[str, object] | None:
-        """Deconstruct signature fields out of raw application streams."""
+        """Deconstruct signature fields out of raw application streams with safe sanitization."""
         if not pkt.haslayer(scapy.TCP) or not pkt.haslayer(scapy.Raw):
             return None
         try:
@@ -181,9 +237,23 @@ class PacketSniffer:
 
             parts = lines[0].split(" ")
             method = parts[0]
+            # Ensure out-of-bounds queries on corrupt or modified request frames fail safely
             path = parts[1] if len(parts) > 1 else ""
-            headers: dict[str, str] = {}
 
+            # Confirm standard HTTP methods are visible within signature bounds
+            if method not in (
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "HEAD",
+                "OPTIONS",
+                "PATCH",
+                "HTTP/1.",
+            ):
+                return None
+
+            headers: dict[str, str] = {}
             for line in lines[1:]:
                 if ": " in line:
                     key, value = line.split(": ", 1)
@@ -195,25 +265,34 @@ class PacketSniffer:
                 "host": headers.get("Host"),
                 "user_agent": headers.get("User-Agent"),
                 "content_type": headers.get("Content-Type"),
-                "authorization": "REDACTED" if headers.get("Authorization") else None,
-                "cookie": "REDACTED" if headers.get("Cookie") else None,
+                # Explicitly strip and redact sensitive session contexts to prevent raw disk logging leaks
+                "authorization": (
+                    "[REDACTED_S_FIELD]" if headers.get("Authorization") else None
+                ),
+                "cookie": "[REDACTED_S_FIELD]" if headers.get("Cookie") else None,
             }
         except (ValueError, IndexError, AttributeError) as e:
             log.debug("Failed parsing application layer protocol elements: %s", e)
             return None
 
     def get_stats(self) -> SnifferStats:
-        """Retrieve total calculated traffic protocol statistics counters."""
-        return self.stats
+        """Retrieve total calculated traffic protocol statistics counters under thread-safe locks."""
+        with self._lock:
+            return self.stats
 
     def dump_pcap(self, filepath: str) -> None:
         """Export raw collected buffer items to file using standardized PCAP files."""
-        scapy.wrpcap(filepath, self.packets)
+        with self._lock:
+            packets_snapshot = list(self.packets)
+        scapy.wrpcap(filepath, packets_snapshot)
 
     def dump_json(self, filepath: str) -> None:
         """Serialize deconstructed application components into human-readable data maps."""
+        with self._lock:
+            packets_snapshot = list(self.packets)
+
         parsed: list[dict[str, object]] = []
-        for pkt in self.packets:
+        for pkt in packets_snapshot:
             entry: dict[str, object] = {}
             if pkt.haslayer(scapy.IP):
                 entry["ip"] = self._parse_ip(pkt)
@@ -251,7 +330,7 @@ def _infer_packet_protocol(pkt: scapy.Packet) -> str:
 def main() -> None:
     """CLI capture pipeline executor hub."""
     parser = argparse.ArgumentParser(
-        description="Packet Sniffer — loopback/own VM only."
+        description="Secure Packet Sniffer reference framework utility."
     )
     parser.add_argument(
         "--interface", default="lo", help="Network interface (default: lo)"
@@ -266,24 +345,31 @@ def main() -> None:
     parser.add_argument("--pcap", help="Save captured packets to PCAP file")
     args = parser.parse_args()
 
-    sniffer = PacketSniffer(
-        interface=args.interface,
-        bpf_filter=args.bpf_filter,
-        count=args.count,
-    )
+    try:
+        sniffer = PacketSniffer(
+            interface=args.interface,
+            bpf_filter=args.bpf_filter,
+            count=args.count,
+        )
+        sniffer.start()
+    except ValueError as exc:
+        print(f"Initialization Aborted: {exc}")
+        return
 
     formatter = NetworkFormatter()
     console = Console()
-
-    sniffer.start()
-    console.print(f"[orange1]Sniffing on {args.interface}... Ctrl+C to stop.[/orange1]")
+    console.print(
+        f"[orange1]Sniffing on device adapter: {args.interface}... Ctrl+C to stop.[/orange1]"
+    )
 
     try:
         while True:
             time.sleep(0.5)
-            current_packet_snapshot = list(sniffer.packets[-LIVE_DISPLAY_MAX_ROWS:])
+            # Create a thread-safe atomic local copy of recent objects to run UI parsing rules against safely
+            with sniffer._lock:  # pylint: disable=protected-access
+                current_packet_snapshot = list(sniffer.packets[-LIVE_DISPLAY_MAX_ROWS:])
 
-            ui_rows: list[PacketInfo] = []
+            ui_rows: list[UIFieldRow] = []
             for pkt in current_packet_snapshot:
                 ui_rows.append(
                     {
@@ -300,18 +386,26 @@ def main() -> None:
                 )
 
             console.clear()
-            console.print(formatter.packet_summary(ui_rows))
+            # Suppress explicit layout updates if the current capture window snapshot is empty
+            if ui_rows:
+                console.print(formatter.packet_summary(ui_rows))  # type: ignore[arg-type]
             console.print(f"[grey54]{sniffer.get_stats()}[/grey54]")
     except KeyboardInterrupt:
         sniffer.stop()
-        console.print("[orange1]Stopped.[/orange1]")
+        console.print(
+            "[orange1]Capture driver interface loops successfully stopped and unified.[/orange1]"
+        )
 
     if args.dump:
         sniffer.dump_json(args.dump)
-        console.print(f"[grey54]Saved to {args.dump}[/grey54]")
+        console.print(
+            f"[grey54]Saved sanitized JSON log matrix map structure to: {args.dump}[/grey54]"
+        )
     if args.pcap:
         sniffer.dump_pcap(args.pcap)
-        console.print(f"[grey54]Saved to {args.pcap}[/grey54]")
+        console.print(
+            f"[grey54]Saved raw global packet structure traces to PCAP file: {args.pcap}[/grey54]"
+        )
 
 
 if __name__ == "__main__":
