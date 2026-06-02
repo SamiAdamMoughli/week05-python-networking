@@ -37,3 +37,4 @@ scripts/marco_polo_*.md
 data/login_capture.pcap
 scripts/marco_polo_*.md
 data/login_capture.pcap
+capture.json
